@@ -874,7 +874,10 @@ CSS = """
 :root { --navy:#0B1F3A; --navy2:#14304F; --cream:#F7F2E8; --cream2:#EFE7D6;
         --gold:#B8924A; --line:#D9CFBA; --muted:#5B6B80; }
 
-html, body, .stApp, [class*="st-"] { font-family: 'Inter', -apple-system, sans-serif; }
+html, body, .stApp, .stApp p, .stApp label, .stApp input, .stApp textarea, .stApp button,
+.stApp li, .stApp td, .stApp th { font-family: 'Inter', -apple-system, sans-serif; }
+[data-testid="stIconMaterial"], .material-symbols-rounded, .material-icons {
+        font-family: 'Material Symbols Rounded', 'Material Icons' !important; }
 .stApp { background: var(--cream); color: var(--navy); }
 .block-container { max-width: 1180px; padding-top: 1.6rem; padding-bottom: 4rem; }
 header[data-testid="stHeader"] { background: transparent; }
