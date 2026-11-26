@@ -3,3 +3,7 @@ requests
 beautifulsoup4
 pandas
 openpyxl
+reportlab
+dnspython
+gspread>=6.0
+google-auth
