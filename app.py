@@ -1,15 +1,18 @@
 """
-Lead Enrichment Tool
-Upload scraped lead sheets (CSV / Excel) -> the tool visits each business website,
-finds the email + owner name, works out the business type and working region,
-removes repeated businesses, and gives you a clean table + CSV download.
+Lead Enrichment Tool (premium edition)
+Upload scraped lead sheets -> finds emails + owner names, business type, working region,
+scores each homepage for SEO, removes repeats and leads with no website/email,
+and exports to CSV, Excel, Google Sheets, PDF, JSON or copy-paste.
 """
 
+import io
 import json
 import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from urllib.parse import unquote, urljoin, urlparse
+from xml.sax.saxutils import escape as xml_escape
 
 import pandas as pd
 import requests
@@ -142,7 +145,6 @@ def classify_type(name_text, meta_text, body_text):
 # =====================================================================
 # REGION
 # =====================================================================
-# (canonical region, country, [aliases], needs_country_hint)
 REGIONS = [
     ("Sydney, NSW", "AU", ["sydney", "parramatta", "penrith", "blacktown", "campbelltown", "hornsby",
                            "the hills district", "hills district", "northern beaches", "north shore",
@@ -209,7 +211,6 @@ def country_from_host(host):
 
 
 def detect_region(weighted_texts, country):
-    """weighted_texts: list of (text, weight). Returns (main_region, other_regions)."""
     counts = Counter()
     for text, weight in weighted_texts:
         t = text.lower()
@@ -233,28 +234,29 @@ def detect_region(weighted_texts, country):
 # FETCHING
 # =====================================================================
 def fetch(url, timeout):
-    """Returns (html, final_url, error_reason)."""
+    """Returns (html, final_url, error_reason, seconds_taken)."""
     err = "Could not open site"
     for verify in (True, False):
         try:
             r = requests.get(url, headers=HEADERS, timeout=timeout, verify=verify)
+            took = r.elapsed.total_seconds() if getattr(r, "elapsed", None) else 0.0
             if r.status_code in (401, 403, 429):
-                return None, None, f"Blocked by site ({r.status_code})"
+                return None, None, f"Blocked by site ({r.status_code})", took
             if r.status_code >= 400:
-                return None, None, f"Page error ({r.status_code})"
+                return None, None, f"Page error ({r.status_code})", took
             if "html" not in r.headers.get("Content-Type", "").lower():
-                return None, None, "Not a web page"
-            return r.text, r.url, ""
+                return None, None, "Not a web page", took
+            return r.text, r.url, "", took
         except requests.exceptions.SSLError:
             err = "SSL problem"
             continue
         except requests.exceptions.Timeout:
-            return None, None, "Timed out"
+            return None, None, "Timed out", 0.0
         except requests.exceptions.ConnectionError:
-            return None, None, "Site not reachable"
+            return None, None, "Site not reachable", 0.0
         except Exception:
-            return None, None, "Could not open site"
-    return None, None, err
+            return None, None, "Could not open site", 0.0
+    return None, None, err, 0.0
 
 
 def url_variants(url):
@@ -367,7 +369,6 @@ def names_from_jsonld(blocks):
 
 
 def places_from_jsonld(blocks):
-    """Collect address / area-served text from structured data (very reliable when present)."""
     out = []
 
     def walk(node):
@@ -456,11 +457,183 @@ def pick_email(emails, site_host):
 
 
 # =====================================================================
+# SEO SCORE (homepage, 100 points)
+# =====================================================================
+def seo_audit(soup, final_url, elapsed, region):
+    """Returns (score 0-100, list of issues). Based on the homepage only."""
+    score, issues = 0, []
+
+    if final_url.startswith("https://"):
+        score += 10
+    else:
+        issues.append("Site is not on HTTPS")
+
+    title = soup.title.string.strip() if soup.title and soup.title.string else ""
+    if title:
+        if 25 <= len(title) <= 65:
+            score += 12
+        else:
+            score += 6
+            issues.append(f"Page title length is off ({len(title)} characters)")
+    else:
+        issues.append("Missing page title")
+
+    md = soup.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
+    desc = (md.get("content") or "").strip() if md else ""
+    if desc:
+        if 100 <= len(desc) <= 170:
+            score += 12
+        else:
+            score += 6
+            issues.append("Meta description length is off")
+    else:
+        issues.append("Missing meta description")
+
+    h1s = soup.find_all("h1")
+    if len(h1s) == 1:
+        score += 10
+    elif len(h1s) > 1:
+        score += 5
+        issues.append("More than one H1 heading")
+    else:
+        issues.append("No H1 heading")
+
+    if soup.find("meta", attrs={"name": re.compile(r"^viewport$", re.I)}):
+        score += 10
+    else:
+        issues.append("Not mobile-optimised (no viewport tag)")
+
+    imgs = soup.find_all("img")
+    if imgs:
+        ratio = sum(1 for i in imgs if (i.get("alt") or "").strip()) / len(imgs)
+        if ratio >= 0.8:
+            score += 8
+        elif ratio >= 0.5:
+            score += 4
+            issues.append("Many images have no alt text")
+        else:
+            issues.append("Most images have no alt text")
+    else:
+        score += 8
+
+    if soup.find("link", rel="canonical"):
+        score += 4
+    else:
+        issues.append("No canonical tag")
+
+    if soup.find("script", type="application/ld+json"):
+        score += 8
+    else:
+        issues.append("No structured data (schema)")
+
+    if soup.find("meta", attrs={"property": "og:title"}):
+        score += 4
+    else:
+        issues.append("No social sharing tags")
+
+    words = len(" ".join(t.get_text(" ", strip=True)
+                         for t in soup.find_all(["p", "h1", "h2", "h3", "h4", "li"])).split())
+    if words >= 300:
+        score += 8
+    elif words >= 150:
+        score += 4
+        issues.append("Thin homepage content")
+    else:
+        issues.append("Very little text on the homepage")
+
+    host = host_of(final_url)
+    internal = 0
+    for a in soup.find_all("a", href=True):
+        h = a["href"].strip()
+        if h.startswith("/") or (host and host in h):
+            internal += 1
+    if internal >= 5:
+        score += 4
+    else:
+        issues.append("Few internal links")
+
+    if elapsed and elapsed < 2.5:
+        score += 6
+    elif elapsed and elapsed < 5:
+        score += 3
+    elif elapsed:
+        issues.append("Slow server response")
+    else:
+        score += 3
+
+    city = region.split(",")[0].strip().lower() if region else ""
+    head_text = (title + " " + " ".join(h.get_text(" ", strip=True) for h in h1s)).lower()
+    if city and city in head_text:
+        score += 4
+    else:
+        issues.append("Location not in title or main heading")
+
+    return score, issues
+
+
+def seo_rating(score):
+    if score is None or score == "":
+        return ""
+    return "Strong" if score >= 75 else "Average" if score >= 50 else "Weak"
+
+
+def pagespeed(url, key):
+    """Optional Google PageSpeed (Lighthouse). Returns (performance, seo) or (None, None)."""
+    params = [("url", url), ("strategy", "mobile"), ("category", "performance"), ("category", "seo")]
+    if key:
+        params.append(("key", key))
+    try:
+        r = requests.get("https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
+                         params=params, timeout=70)
+        if r.status_code != 200:
+            return None, None
+        cats = r.json()["lighthouseResult"]["categories"]
+        return round(cats["performance"]["score"] * 100), round(cats["seo"]["score"] * 100)
+    except Exception:
+        return None, None
+
+
+# =====================================================================
+# EMAIL DOMAIN CHECK
+# =====================================================================
+_MAIL_CACHE = {}
+
+
+def mail_domain_status(domain):
+    """Checks that the email's domain can receive mail (it cannot confirm the mailbox itself)."""
+    if domain in _MAIL_CACHE:
+        return _MAIL_CACHE[domain]
+    if domain in FREE_MAIL:
+        return "Mail domain OK"
+    status = "Unchecked"
+    try:
+        import dns.resolver
+        try:
+            dns.resolver.resolve(domain, "MX", lifetime=6)
+            status = "Mail domain OK"
+        except dns.resolver.NoAnswer:
+            try:
+                dns.resolver.resolve(domain, "A", lifetime=6)
+                status = "Mail domain OK"
+            except Exception:
+                status = "No mail server found"
+        except dns.resolver.NXDOMAIN:
+            status = "Domain not found"
+    except Exception:
+        status = "Unchecked"
+    _MAIL_CACHE[domain] = status
+    return status
+
+
+# =====================================================================
 # ONE BUSINESS
 # =====================================================================
-def process_site(name_hint, raw_url, category_hint, address_hint, timeout, max_pages):
+def process_site(name_hint, raw_url, category_hint, address_hint, timeout, max_pages,
+                 psi_on=False, psi_key=""):
     out = {"Owner Full Name": "", "Owner First Name": "", "Owner Last Name": "",
-           "Email": "", "Business Type": "", "Working Region": "", "Other Regions": "",
+           "Email": "", "Email Check": "", "Business Type": "", "Working Region": "",
+           "Other Regions": "", "SEO Score": None, "SEO Rating": "", "SEO Issues": "",
+           "PageSpeed Performance": None, "PageSpeed SEO": None,
            "Name Source Page": "", "Email Source Page": "", "Skipped Emails": "",
            "Status": ""}
 
@@ -471,15 +644,16 @@ def process_site(name_hint, raw_url, category_hint, address_hint, timeout, max_p
 
     meta_text, body_text, place_text = "", "", ""
     emails, pages = [], []
+    home = None  # (soup, final_url, elapsed)
 
     if not url:
         out["Status"] = "No website"
     elif any(host == h or host.endswith("." + h) for h in SOCIAL_HOSTS):
         out["Status"] = "Social/listing page, not a business website"
     else:
-        html, final_url, first_err = None, None, ""
+        html, final_url, first_err, took = None, None, "", 0.0
         for variant in url_variants(url):
-            html, final_url, err = fetch(variant, timeout)
+            html, final_url, err, took = fetch(variant, timeout)
             if html:
                 break
             first_err = first_err or err
@@ -488,15 +662,17 @@ def process_site(name_hint, raw_url, category_hint, address_hint, timeout, max_p
         else:
             host = host_of(final_url)
             country = country_from_host(host) or country
-            pages = [(final_url, BeautifulSoup(html, "html.parser"), html)]
+            home_soup = BeautifulSoup(html, "html.parser")
+            home = (home_soup, final_url, took)
+            pages = [(final_url, home_soup, html)]
             seen = {final_url}
-            for link in find_links(pages[0][1], final_url):
+            for link in find_links(home_soup, final_url):
                 if len(pages) > max_pages:
                     break
                 if link in seen:
                     continue
                 seen.add(link)
-                h, u, _ = fetch(link, timeout)
+                h, u, _, _ = fetch(link, timeout)
                 if h:
                     pages.append((u, BeautifulSoup(h, "html.parser"), h))
 
@@ -530,6 +706,7 @@ def process_site(name_hint, raw_url, category_hint, address_hint, timeout, max_p
             out["Skipped Emails"] = "; ".join(skipped)
             if best:
                 out["Status"] = "OK"
+                out["Email Check"] = mail_domain_status(best.split("@")[1])
             elif out["Owner Full Name"]:
                 out["Status"] = "Name only (no usable email on site)"
             elif skipped:
@@ -541,6 +718,14 @@ def process_site(name_hint, raw_url, category_hint, address_hint, timeout, max_p
     region, others = detect_region(
         [(address_hint, 20), (place_text, 10), (meta_text, 3), (body_text, 1)], country)
     out["Working Region"], out["Other Regions"] = region, others
+
+    if home:
+        score, issues = seo_audit(home[0], home[1], home[2], region)
+        out["SEO Score"] = score
+        out["SEO Rating"] = seo_rating(score)
+        out["SEO Issues"] = "; ".join(issues[:4])
+        if psi_on and out["Email"]:
+            out["PageSpeed Performance"], out["PageSpeed SEO"] = pagespeed(home[1], psi_key)
     return out
 
 
@@ -583,28 +768,203 @@ def dedupe_key(name, raw_url):
 
 
 def safe_cell(v):
-    v = "" if v is None else str(v)
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    v = str(v)
     return "'" + v if v[:1] in ("=", "@") else v
+
+
+# =====================================================================
+# EXPORTS
+# =====================================================================
+NAVY, CREAM, GOLD = "#0B1F3A", "#F7F2E8", "#B8924A"
+
+
+def to_xlsx(df):
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Leads")
+        ws = writer.sheets["Leads"]
+        for cell in ws[1]:
+            cell.font = Font(bold=True, color="F7F2E8")
+            cell.fill = PatternFill("solid", fgColor="0B1F3A")
+            cell.alignment = Alignment(vertical="center")
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for i, col in enumerate(df.columns, start=1):
+            longest = max([len(str(col))] + [len(str(v)) for v in df[col].head(300)])
+            ws.column_dimensions[get_column_letter(i)].width = min(max(12, longest + 2), 55)
+    return buf.getvalue()
+
+
+def to_pdf(df):
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    wanted = [("Business Name", 150), ("Business Type", 90), ("Working Region", 90),
+              ("Owner Full Name", 100), ("Email", 150), ("Website URL", 150), ("SEO Score", 40)]
+    cols = [(c, w) for c, w in wanted if c in df.columns]
+    navy, cream, gold = colors.HexColor(NAVY), colors.HexColor(CREAM), colors.HexColor(GOLD)
+
+    cell = ParagraphStyle("cell", fontName="Helvetica", fontSize=7.5, leading=9.5, textColor=navy)
+    head = ParagraphStyle("head", fontName="Helvetica-Bold", fontSize=8, leading=10, textColor=cream)
+    title = ParagraphStyle("title", fontName="Helvetica-Bold", fontSize=18, leading=22, textColor=navy)
+    sub = ParagraphStyle("sub", fontName="Helvetica", fontSize=9, leading=12, textColor=gold)
+
+    data = [[Paragraph(xml_escape(c), head) for c, _ in cols]]
+    for _, row in df.iterrows():
+        data.append([Paragraph(xml_escape(safe_cell(row[c])), cell) for c, _ in cols])
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=24, rightMargin=24,
+                            topMargin=28, bottomMargin=28, title="Lead list")
+    table = Table(data, colWidths=[w for _, w in cols], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), navy),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F3ECDD")]),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.25, colors.HexColor("#D9CFBA")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    doc.build([
+        Paragraph("Lead list", title),
+        Paragraph(f"{len(df)} businesses · prepared {datetime.now():%d %B %Y}", sub),
+        Spacer(1, 12), table,
+    ])
+    return buf.getvalue()
+
+
+def sheets_configured():
+    try:
+        return "gcp_service_account" in st.secrets
+    except Exception:
+        return False
+
+
+def push_to_sheets(df, sheet_url):
+    import gspread
+    from google.oauth2.service_account import Credentials
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]),
+        scopes=["https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"])
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_url(sheet_url)
+    title = f"Leads {datetime.now():%d %b %H:%M}"
+    rows = [df.columns.tolist()] + [[safe_cell(v) for v in r] for r in df.itertuples(index=False)]
+    ws = sh.add_worksheet(title=title, rows=len(rows) + 5, cols=len(df.columns) + 1)
+    ws.update(range_name="A1", values=rows, value_input_option="RAW")
+    return f"{sh.url}#gid={ws.id}", title
+
+
+# =====================================================================
+# DESIGN
+# =====================================================================
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap');
+
+:root { --navy:#0B1F3A; --navy2:#14304F; --cream:#F7F2E8; --cream2:#EFE7D6;
+        --gold:#B8924A; --line:#D9CFBA; --muted:#5B6B80; }
+
+html, body, .stApp, [class*="st-"] { font-family: 'Inter', -apple-system, sans-serif; }
+.stApp { background: var(--cream); color: var(--navy); }
+.block-container { max-width: 1180px; padding-top: 1.6rem; padding-bottom: 4rem; }
+header[data-testid="stHeader"] { background: transparent; }
+footer { visibility: hidden; }
+
+h1, h2, h3, h4 { font-family: 'Fraunces', Georgia, serif !important; color: var(--navy);
+                 letter-spacing: -0.01em; font-weight: 500; }
+
+.hero { background: linear-gradient(135deg, #0B1F3A 0%, #14304F 100%);
+        border-radius: 22px; padding: 46px 52px; margin-bottom: 34px;
+        box-shadow: 0 18px 40px rgba(11,31,58,.18); position: relative; overflow: hidden; }
+.hero:after { content:""; position:absolute; right:-80px; top:-80px; width:260px; height:260px;
+              border-radius:50%; border:1px solid rgba(184,146,74,.45); }
+.hero .eyebrow { color: var(--gold); font-size: 12px; letter-spacing: .22em; font-weight: 600;
+                 text-transform: uppercase; margin-bottom: 14px; }
+.hero h1 { font-family:'Fraunces',serif !important; color: var(--cream) !important; font-size: 46px;
+           line-height: 1.08; margin: 0 0 14px 0; font-weight: 500; }
+.hero p { color: #D9D2C0; font-size: 16px; max-width: 640px; line-height: 1.6; margin: 0; }
+
+.sec { display:flex; align-items:baseline; gap:16px; margin: 42px 0 14px 0;
+       border-bottom: 1px solid var(--line); padding-bottom: 12px; }
+.sec .num { font-family:'Fraunces',serif; color: var(--gold); font-size: 15px; letter-spacing: .12em; }
+.sec .ttl { font-family:'Fraunces',serif; font-size: 27px; color: var(--navy); font-weight: 500; }
+.sec .sub { color: var(--muted); font-size: 14px; margin-left: auto; }
+
+[data-testid="stFileUploader"] section { background: #FBF8F1; border: 1.5px dashed var(--gold);
+        border-radius: 16px; padding: 26px; }
+[data-testid="stFileUploader"] section:hover { background: #fff; }
+
+.stButton > button, .stDownloadButton > button, .stLinkButton > a {
+        background: var(--navy) !important; color: var(--cream) !important; border: 1px solid var(--navy) !important;
+        border-radius: 12px !important; padding: .72rem 1.5rem !important; font-weight: 600 !important;
+        letter-spacing: .01em; transition: all .18s ease; box-shadow: 0 6px 16px rgba(11,31,58,.16); }
+.stButton > button:hover, .stDownloadButton > button:hover, .stLinkButton > a:hover {
+        background: var(--gold) !important; border-color: var(--gold) !important; color: var(--navy) !important;
+        transform: translateY(-1px); }
+.stButton > button p, .stDownloadButton > button p, .stLinkButton > a p { color: inherit !important; }
+
+[data-testid="stMetric"] { background: #FBF8F1; border: 1px solid var(--line); border-radius: 16px;
+        padding: 18px 20px; }
+[data-testid="stMetricLabel"] p { color: var(--muted); font-size: 12px; letter-spacing: .08em;
+        text-transform: uppercase; font-weight: 600; }
+[data-testid="stMetricValue"] { font-family: 'Fraunces', serif; color: var(--navy); font-weight: 500; }
+
+[data-testid="stExpander"] { background: #FBF8F1; border: 1px solid var(--line); border-radius: 14px; }
+[data-baseweb="select"] > div, .stTextInput input { background: #FBF8F1 !important;
+        border-color: var(--line) !important; border-radius: 10px !important; }
+[data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+.stAlert { border-radius: 12px; }
+.note { color: var(--muted); font-size: 13px; line-height: 1.6; }
+</style>
+"""
+
+
+def section(num, title, sub=""):
+    st.markdown(
+        f'<div class="sec"><span class="num">{num}</span><span class="ttl">{title}</span>'
+        f'<span class="sub">{sub}</span></div>', unsafe_allow_html=True)
 
 
 # =====================================================================
 # APP
 # =====================================================================
-st.set_page_config(page_title="Lead Enrichment Tool", page_icon="📇", layout="wide")
-st.title("📇 Lead Enrichment Tool")
-st.caption("Upload your scraped sheets. The tool finds emails and owner names, works out the "
-           "business type and region, removes repeats, and gives you a ready-to-use CSV.")
+st.set_page_config(page_title="Lead Intelligence", page_icon="📇", layout="wide")
+st.markdown(CSS, unsafe_allow_html=True)
+st.markdown(
+    '<div class="hero"><div class="eyebrow">Lead Intelligence</div>'
+    '<h1>Turn a scraped list into<br>ready-to-contact leads.</h1>'
+    '<p>Upload your sheets. We find the email and owner, identify the business type and region, '
+    'score each homepage for SEO, remove repeats, and hand you a clean list in the format you need.</p>'
+    '</div>', unsafe_allow_html=True)
 
-with st.sidebar:
-    st.header("Settings")
-    workers = st.slider("Sites processed at once", 2, 16, 8)
-    max_pages = st.slider("Extra pages checked per site", 1, 6, 4,
+section("01", "Upload", "CSV or Excel · several files at once")
+files = st.file_uploader("Upload your sheets", type=["csv", "xlsx", "xls"],
+                         accept_multiple_files=True, label_visibility="collapsed")
+
+with st.expander("Advanced settings"):
+    a1, a2, a3 = st.columns(3)
+    workers = a1.slider("Sites processed at once", 2, 16, 8)
+    max_pages = a2.slider("Extra pages checked per site", 1, 6, 4,
                           help="Contact, About and Team pages.")
-    timeout = st.slider("Seconds to wait per page", 5, 30, 12)
-    st.info("Tip: run 100 to 300 businesses at a time and keep this tab open until it finishes.")
-
-files = st.file_uploader("Upload your CSV or Excel sheets (you can add several at once)",
-                         type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+    timeout = a3.slider("Seconds to wait per page", 5, 30, 12)
+    drop_unreachable = st.checkbox(
+        "Remove leads with no website or no email", value=True,
+        help="Leads are never removed for a good SEO score or a good-looking site.")
+    psi_on = st.checkbox(
+        "Also run Google PageSpeed on each lead (slower)", value=False,
+        help="Adds Google's mobile performance and SEO scores. Roughly 10 extra minutes per 200 leads.")
+    psi_key = st.text_input("Google PageSpeed API key (optional)", type="password",
+                            help="Free from Google Cloud. Without a key, Google limits how many checks you can run.")
 
 if files:
     frames, read_errors = [], []
@@ -619,10 +979,8 @@ if files:
     if frames:
         raw = pd.concat(frames, ignore_index=True).fillna("")
         cols = list(raw.columns)
-        st.success(f"Loaded {len(raw)} rows from {len(frames)} file(s).")
 
-        st.subheader("1. Check the columns")
-        st.caption("The tool guesses these. Change any that are wrong.")
+        section("02", "Check the columns", f"{len(raw)} rows loaded from {len(frames)} file(s)")
         none_opt = "(none)"
         opts = [none_opt] + cols
 
@@ -639,7 +997,7 @@ if files:
         col_name = c1.selectbox("Business name", opts, index=idx(g_name))
         col_url = c2.selectbox("Website URL", opts, index=idx(g_url))
         col_cat = c3.selectbox("Category (optional)", opts, index=idx(g_cat))
-        col_addr = c4.selectbox("Address / location (optional)", opts, index=idx(g_addr))
+        col_addr = c4.selectbox("Address (optional)", opts, index=idx(g_addr))
 
         if col_name == none_opt or col_url == none_opt:
             st.warning("Please choose the Business name and Website URL columns.")
@@ -651,100 +1009,186 @@ if files:
                 "_addr": raw[col_addr].astype(str) if col_addr != none_opt else "",
             })
             work = work[(work["Business Name"] != "") | (work["Website URL"] != "")]
-            keys = [dedupe_key(n, u) for n, u in zip(work["Business Name"], work["Website URL"])]
-            work["_key"] = keys
+            work["_key"] = [dedupe_key(n, u) for n, u in zip(work["Business Name"], work["Website URL"])]
             before = len(work)
             work = work[work["_key"].isna() | ~work["_key"].duplicated(keep="first")]
             removed_pre = before - len(work)
             work = work.reset_index(drop=True)
 
-            st.write(f"**{len(work)} unique businesses** to process "
-                     f"({removed_pre} repeated rows removed).")
-
-            st.subheader("2. Process")
-            if st.button("▶ Start processing", type="primary"):
+            section("03", "Process", f"{len(work)} unique businesses · {removed_pre} repeats removed")
+            if st.button("Start processing"):
                 total = len(work)
                 results = {}
                 progress = st.progress(0.0, text="Starting...")
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     futs = {
-                        ex.submit(process_site, r["Business Name"], r["Website URL"],
-                                  r["_cat"], r["_addr"], timeout, max_pages): i
+                        ex.submit(process_site, r["Business Name"], r["Website URL"], r["_cat"],
+                                  r["_addr"], timeout, max_pages, psi_on, psi_key): i
                         for i, r in work.iterrows()
                     }
                     for n, fut in enumerate(as_completed(futs), start=1):
                         i = futs[fut]
                         try:
                             results[i] = fut.result()
-                        except Exception as e:  # never let one bad site stop the run
+                        except Exception as e:  # one bad site never stops the run
                             results[i] = {"Status": f"Error: {e}"}
                         progress.progress(n / total, text=f"{n} of {total} businesses done")
                 progress.empty()
 
                 out_cols = ["Owner Full Name", "Owner First Name", "Owner Last Name", "Email",
-                            "Business Type", "Working Region", "Other Regions",
-                            "Name Source Page", "Email Source Page", "Skipped Emails", "Status"]
+                            "Email Check", "Business Type", "Working Region", "Other Regions",
+                            "SEO Score", "SEO Rating", "SEO Issues", "PageSpeed Performance",
+                            "PageSpeed SEO", "Name Source Page", "Email Source Page",
+                            "Skipped Emails", "Status"]
                 for c in out_cols:
-                    work[c] = [results.get(i, {}).get(c, "") for i in range(len(work))]
+                    work[c] = [results.get(i, {}).get(c, None) for i in range(len(work))]
+                for c in out_cols:
+                    if c not in ("SEO Score", "PageSpeed Performance", "PageSpeed SEO"):
+                        work[c] = work[c].fillna("")
+                for c in ("SEO Score", "PageSpeed Performance", "PageSpeed SEO"):
+                    work[c] = pd.to_numeric(work[c], errors="coerce")
 
                 before2 = len(work)
-                has_email = work["Email"] != ""
-                dup_email = has_email & work["Email"].duplicated(keep="first")
+                dup_email = (work["Email"] != "") & work["Email"].duplicated(keep="first")
                 work = work[~dup_email].reset_index(drop=True)
                 removed_post = before2 - len(work)
 
-                st.session_state["results"] = work.drop(columns=["_cat", "_addr", "_key"])
+                has_site = work["Website URL"].str.strip() != ""
+                has_email = work["Email"] != ""
+                if drop_unreachable:
+                    keep = has_site & has_email
+                else:
+                    keep = pd.Series(True, index=work.index)
+                kept = work[keep].drop(columns=["_cat", "_addr", "_key"]).reset_index(drop=True)
+                dropped = work[~keep].drop(columns=["_cat", "_addr", "_key"]).reset_index(drop=True)
+
+                st.session_state["results"] = kept
+                st.session_state["removed"] = dropped
                 st.session_state["stats"] = {
-                    "uploaded": before, "removed_pre": removed_pre, "removed_post": removed_post,
+                    "uploaded": before, "dupes": removed_pre + removed_post, "noemail": len(dropped),
                 }
                 st.rerun()
 
 if "results" in st.session_state:
     df = st.session_state["results"]
+    dropped = st.session_state["removed"]
     stats = st.session_state["stats"]
 
-    st.divider()
-    st.subheader("3. Your results")
+    section("04", "Your leads", "Filter, review and export")
 
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Rows uploaded", stats["uploaded"])
-    m2.metric("Repeats removed", stats["removed_pre"] + stats["removed_post"])
-    m3.metric("Businesses kept", len(df))
-    m4.metric("With email", int((df["Email"] != "").sum()))
+    m2.metric("Repeats removed", stats["dupes"])
+    m3.metric("No email / website", stats["noemail"])
+    m4.metric("Leads ready", len(df))
     m5.metric("With owner name", int((df["Owner Full Name"] != "").sum()))
+    st.write("")
 
-    f1, f2, f3 = st.columns([2, 2, 1])
+    f1, f2, f3 = st.columns(3)
     types = sorted(df["Business Type"].unique())
     regions = sorted([r for r in df["Working Region"].unique() if r])
+    ratings = [r for r in ["Weak", "Average", "Strong"] if r in set(df["SEO Rating"])]
     pick_types = f1.multiselect("Business type", types, default=types)
     pick_regions = f2.multiselect("Working region (empty = all)", regions)
-    only_email = f3.checkbox("Only with email")
-    show_details = st.checkbox("Show source pages and status (to verify results)")
+    pick_ratings = f3.multiselect("SEO rating (empty = all)", ratings)
+    show_details = st.checkbox("Show source pages and checks (to verify results)")
 
     view = df[df["Business Type"].isin(pick_types)]
     if pick_regions:
         view = view[view["Working Region"].isin(pick_regions)]
-    if only_email:
-        view = view[view["Email"] != ""]
+    if pick_ratings:
+        view = view[view["SEO Rating"].isin(pick_ratings)]
 
     main_cols = ["Business Name", "Business Type", "Working Region", "Owner Full Name",
-                 "Owner First Name", "Owner Last Name", "Email", "Website URL"]
-    detail_cols = ["Other Regions", "Name Source Page", "Email Source Page",
+                 "Owner First Name", "Owner Last Name", "Email", "Website URL",
+                 "SEO Score", "SEO Rating", "SEO Issues"]
+    detail_cols = ["Email Check", "Other Regions", "Name Source Page", "Email Source Page",
                    "Skipped Emails", "Status"]
+    if df["PageSpeed Performance"].notna().any():
+        detail_cols = ["PageSpeed Performance", "PageSpeed SEO"] + detail_cols
     show_cols = main_cols + (detail_cols if show_details else [])
     view = view[show_cols].reset_index(drop=True)
 
-    st.dataframe(view, hide_index=True,
-                 column_config={"Website URL": st.column_config.LinkColumn("Website URL")})
-    st.caption(f"Showing {len(view)} of {len(df)} businesses.")
+    st.dataframe(
+        view, hide_index=True,
+        column_config={
+            "Website URL": st.column_config.LinkColumn(
+                "Website URL", display_text=r"https?://(?:www\.)?([^/]+)"),
+            "SEO Score": st.column_config.ProgressColumn(
+                "SEO Score", min_value=0, max_value=100, format="%d"),
+        })
+    st.markdown(
+        f'<div class="note">Showing {len(view)} of {len(df)} leads. SEO score is a 100-point check of '
+        'each homepage (title, description, headings, mobile tag, schema, speed and more). '
+        'It is a guide, not a ranking. No lead is removed for a good score.</div>',
+        unsafe_allow_html=True)
 
-    csv_df = view.apply(lambda col: col.map(safe_cell))
-    st.download_button("⬇ Download CSV", data=csv_df.to_csv(index=False).encode("utf-8-sig"),
-                       file_name="leads_ready.csv", mime="text/csv", type="primary")
-    st.caption("Before sending, verify the emails (MillionVerifier or ZeroBounce) and "
-               "spot-check names against the source pages.")
+    if len(dropped):
+        st.write("")
+        with st.expander(f"Removed leads ({len(dropped)}): no usable email or website"):
+            blocked = int(dropped["Status"].str.contains("Blocked").sum())
+            if blocked:
+                st.info(f"{blocked} sites blocked automatic access. They may still have an email, "
+                        "so open those by hand if you want them.")
+            st.dataframe(dropped[["Business Name", "Website URL", "Status"]], hide_index=True)
 
+    section("05", "Export", "Choose a format")
+    fmt = st.selectbox("Export format",
+                       ["CSV", "Excel (.xlsx)", "Google Sheets", "PDF", "JSON",
+                        "Copy & paste (tab-separated)"], label_visibility="collapsed")
+    stamp = f"{datetime.now():%Y-%m-%d}"
+    export_df = view.copy()
+    if fmt == "CSV":
+        csv_df = export_df.apply(lambda col: col.map(safe_cell))
+        st.download_button("Download CSV", csv_df.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"leads_{stamp}.csv", mime="text/csv")
+    elif fmt.startswith("Excel"):
+        st.download_button("Download Excel file", to_xlsx(export_df.apply(lambda c: c.map(safe_cell))),
+                           file_name=f"leads_{stamp}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    elif fmt == "PDF":
+        st.download_button("Download PDF", to_pdf(export_df), file_name=f"leads_{stamp}.pdf",
+                           mime="application/pdf")
+        st.markdown('<div class="note">The PDF shows the main columns only. Use CSV or Excel for the full data.</div>',
+                    unsafe_allow_html=True)
+    elif fmt == "JSON":
+        st.download_button("Download JSON",
+                           export_df.where(export_df.notna(), None).to_json(orient="records", indent=2, force_ascii=False),
+                           file_name=f"leads_{stamp}.json", mime="application/json")
+    elif fmt == "Google Sheets":
+        if sheets_configured():
+            sheet_url = st.text_input("Paste the link of your Google Sheet",
+                                      placeholder="https://docs.google.com/spreadsheets/d/...")
+            if st.button("Send to Google Sheets"):
+                if not sheet_url.strip():
+                    st.warning("Paste your Google Sheet link first.")
+                else:
+                    try:
+                        link, tab = push_to_sheets(export_df, sheet_url.strip())
+                        st.success(f"Sent. A new tab called “{tab}” was added.")
+                        st.markdown(f"[Open the sheet]({link})")
+                    except Exception as e:
+                        st.error(f"Could not send to Google Sheets: {e}")
+            st.markdown('<div class="note">Or use the manual route below.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="note">Manual route: 1) download the file, 2) open a blank Google Sheet, '
+            '3) choose File, Import, Upload and select the file.</div>', unsafe_allow_html=True)
+        g1, g2 = st.columns([1, 1])
+        with g1:
+            st.download_button("Download file for Google Sheets",
+                               to_xlsx(export_df.apply(lambda c: c.map(safe_cell))),
+                               file_name=f"leads_{stamp}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        with g2:
+            st.link_button("Open a blank Google Sheet", "https://sheets.new")
+    else:
+        tsv = export_df.apply(lambda col: col.map(safe_cell)).to_csv(sep="\t", index=False)
+        st.code(tsv, language=None)
+        st.markdown('<div class="note">Use the copy icon at the top right of the box, then paste into '
+                    'Google Sheets or Excel.</div>', unsafe_allow_html=True)
+
+    st.write("")
     if st.button("Clear results and start over"):
-        del st.session_state["results"]
-        del st.session_state["stats"]
+        for k in ("results", "removed", "stats"):
+            st.session_state.pop(k, None)
         st.rerun()
